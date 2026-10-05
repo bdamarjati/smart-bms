@@ -1,0 +1,222 @@
+import 'dart:convert';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:smart_bms/features/settings/bms_settings.dart';
+
+void main() {
+  test('default BMS settings match the supplied mockup', () {
+    final settings = BmsSettings.defaults();
+
+    expect(settings.valueFor(BmsSettingKey.overVoltageProtection), 4200);
+    expect(settings.valueFor(BmsSettingKey.underVoltageProtection), 2800);
+    expect(settings.valueFor(BmsSettingKey.overCurrentDischarge), 120);
+    expect(settings.valueFor(BmsSettingKey.resistorShunt), 1.5);
+    expect(settings.valueFor(BmsSettingKey.dayToSleep), 7);
+  });
+
+  test('BMS settings survive a JSON round-trip', () {
+    final settings = BmsSettings.defaults();
+    final restored = BmsSettings.fromJson(settings.toJson());
+
+    for (final definition in bmsSettingDefinitions) {
+      expect(
+        restored.valueFor(definition.key),
+        settings.valueFor(definition.key),
+      );
+    }
+  });
+
+  test('BMS settings map to the Bluetooth parameter JSON format', () {
+    final payload = BmsSettings.defaults().toBluetoothPayload();
+    final json = jsonDecode(payload) as Map<String, dynamic>;
+
+    expect(json, {
+      'ovp': 4200,
+      'ovr': 4100,
+      'uvp': 2800,
+      'uvr': 3000,
+      'occ': 50,
+      'docc': 1000,
+      'ocd': 120,
+      'docd': 2000,
+      'otb': 60,
+      'otbr': 50,
+      'otm': 85,
+      'otmr': 70,
+      'cap': 100,
+      'shunt': 1.5,
+      'bal_min': 3500,
+      'bal_dif': 50,
+      'sleep': 7,
+    });
+    expect(payload, isNot(contains('\n')));
+  });
+
+  test('over-current delays display seconds but retain BLE milliseconds', () {
+    final chargeDelay = bmsSettingDefinitions.firstWhere(
+      (definition) => definition.key == BmsSettingKey.delayOverCurrentCharge,
+    );
+    final dischargeDelay = bmsSettingDefinitions.firstWhere(
+      (definition) => definition.key == BmsSettingKey.delayOverCurrentDischarge,
+    );
+
+    expect(chargeDelay.unit, 's');
+    expect(chargeDelay.toDisplayValue(1000), 1);
+    expect(chargeDelay.toProtocolValue(1), 1000);
+    expect(dischargeDelay.unit, 's');
+    expect(dischargeDelay.toDisplayValue(2000), 2);
+    expect(dischargeDelay.toProtocolValue(2), 2000);
+  });
+
+  test('voltage settings display volts but retain BLE millivolts', () {
+    final voltageDefinitions = bmsSettingDefinitions.where(
+      (definition) => definition.unit == 'V',
+    );
+
+    expect(voltageDefinitions, hasLength(6));
+    for (final definition in voltageDefinitions) {
+      expect(definition.decimalPlaces, 3);
+      expect(definition.toDisplayValue(3650), 3.65);
+      expect(definition.toProtocolValue(3.65), 3650);
+    }
+  });
+
+  test('battery chemistry presets apply supplied values only', () {
+    final original = BmsSettings.defaults();
+    final lfp = original.applyBatteryTypePreset(BmsBatteryType.lfp);
+    final nmc = original.applyBatteryTypePreset(BmsBatteryType.nmc);
+    final lto = original.applyBatteryTypePreset(BmsBatteryType.lto);
+
+    expect(lfp.valueFor(BmsSettingKey.overVoltageProtection), 3649);
+    expect(lfp.valueFor(BmsSettingKey.underVoltageProtection), 2801);
+    expect(lfp.valueFor(BmsSettingKey.underVoltageRelease), 3000);
+    expect(lfp.valueFor(BmsSettingKey.overTemperatureBattery), 47);
+    expect(lfp.valueFor(BmsSettingKey.balancingMinimum), 2799);
+    expect(lfp.matchingBatteryType, BmsBatteryType.lfp);
+
+    expect(nmc.valueFor(BmsSettingKey.overVoltageProtection), 4199);
+    expect(nmc.valueFor(BmsSettingKey.balancingMinimum), 2799);
+    expect(nmc.matchingBatteryType, BmsBatteryType.nmc);
+
+    expect(lto.valueFor(BmsSettingKey.overVoltageProtection), 2750);
+    expect(lto.valueFor(BmsSettingKey.underVoltageProtection), 1800);
+    expect(lto.valueFor(BmsSettingKey.balancingMinimum), 2500);
+    expect(lto.matchingBatteryType, BmsBatteryType.lto);
+
+    for (final settings in [lfp, nmc, lto]) {
+      expect(settings.valueFor(BmsSettingKey.overCurrentCharge), 50);
+      expect(settings.valueFor(BmsSettingKey.overCurrentDischarge), 120);
+      expect(settings.valueFor(BmsSettingKey.batteryCapacity), 100);
+      expect(settings.valueFor(BmsSettingKey.resistorShunt), 1.5);
+    }
+  });
+
+  test('battery protection limits use strict chemistry boundaries', () {
+    final expectedRanges = {
+      BmsBatteryType.lfp: {
+        BmsSettingKey.underVoltageProtection: (2800.0, 3650.0),
+        BmsSettingKey.overVoltageProtection: (2800.0, 3650.0),
+      },
+      BmsBatteryType.nmc: {
+        BmsSettingKey.underVoltageProtection: (2500.0, 3000.0),
+        BmsSettingKey.overVoltageProtection: (3800.0, 4200.0),
+      },
+      BmsBatteryType.lto: {
+        BmsSettingKey.underVoltageProtection: (1500.0, 2000.0),
+        BmsSettingKey.overVoltageProtection: (2400.0, 2800.0),
+      },
+    };
+
+    for (final batteryEntry in expectedRanges.entries) {
+      for (final rangeEntry in batteryEntry.value.entries) {
+        final limit = bmsSettingValueLimitFor(
+          rangeEntry.key,
+          batteryEntry.key,
+        )!;
+        final (minimum, maximum) = rangeEntry.value;
+        expect(limit.allows(minimum), isFalse);
+        expect(limit.allows(minimum + 1), isTrue);
+        expect(limit.allows(maximum - 1), isTrue);
+        expect(limit.allows(maximum), isFalse);
+      }
+    }
+
+    final temperatureLimit = bmsSettingValueLimitFor(
+      BmsSettingKey.overTemperatureBattery,
+      null,
+    )!;
+    expect(temperatureLimit.allows(59.9), isTrue);
+    expect(temperatureLimit.allows(60), isFalse);
+  });
+
+  test('positive-only and balancing voltage limits are strict', () {
+    for (final key in [
+      BmsSettingKey.balancingDifferent,
+      BmsSettingKey.overCurrentCharge,
+      BmsSettingKey.overCurrentDischarge,
+      BmsSettingKey.resistorShunt,
+    ]) {
+      final limit = bmsSettingValueLimitFor(key, BmsBatteryType.lfp)!;
+      expect(limit.allows(0), isFalse, reason: '$key must reject zero');
+      expect(limit.allows(0.001), isTrue, reason: '$key must allow positives');
+    }
+
+    final balancingVoltage = bmsSettingValueLimitFor(
+      BmsSettingKey.balancingMinimum,
+      BmsBatteryType.lfp,
+    )!;
+    expect(balancingVoltage.allows(0), isFalse);
+    expect(balancingVoltage.allows(1), isTrue);
+    expect(balancingVoltage.allows(2799), isTrue);
+    expect(balancingVoltage.allows(2800), isFalse);
+  });
+
+  test('shunt resistance displays with three decimal places', () {
+    final shunt = bmsSettingDefinitions.firstWhere(
+      (definition) => definition.key == BmsSettingKey.resistorShunt,
+    );
+
+    expect(shunt.decimalPlaces, 3);
+  });
+
+  test('BMS settings map from the Bluetooth telemetry JSON format', () {
+    final settings = BmsSettings.fromBluetoothJson({
+      'ovp': 3600,
+      'ovr': 3550,
+      'uvp': 2800,
+      'uvr': 2850,
+      'occ': 50,
+      'docc': 1000,
+      'ocd': 100,
+      'docd': 1000,
+      'otb': 40,
+      'otbr': 38,
+      'otm': 50,
+      'otmr': 45,
+      'cap': 100,
+      'shunt': 1.5,
+      'bal_min': 3500,
+      'bal_dif': 50,
+      'sleep': 7,
+    });
+
+    expect(settings.valueFor(BmsSettingKey.overVoltageProtection), 3600);
+    expect(settings.valueFor(BmsSettingKey.overVoltageRelease), 3550);
+    expect(settings.valueFor(BmsSettingKey.underVoltageProtection), 2800);
+    expect(settings.valueFor(BmsSettingKey.underVoltageRelease), 2850);
+    expect(settings.valueFor(BmsSettingKey.overCurrentCharge), 50);
+    expect(settings.valueFor(BmsSettingKey.delayOverCurrentCharge), 1000);
+    expect(settings.valueFor(BmsSettingKey.overCurrentDischarge), 100);
+    expect(settings.valueFor(BmsSettingKey.delayOverCurrentDischarge), 1000);
+    expect(settings.valueFor(BmsSettingKey.overTemperatureBattery), 40);
+    expect(settings.valueFor(BmsSettingKey.overTemperatureBatteryRelease), 38);
+    expect(settings.valueFor(BmsSettingKey.overTemperatureMosfet), 50);
+    expect(settings.valueFor(BmsSettingKey.overTemperatureMosfetRelease), 45);
+    expect(settings.valueFor(BmsSettingKey.batteryCapacity), 100);
+    expect(settings.valueFor(BmsSettingKey.resistorShunt), 1.5);
+    expect(settings.valueFor(BmsSettingKey.balancingMinimum), 3500);
+    expect(settings.valueFor(BmsSettingKey.balancingDifferent), 50);
+    expect(settings.valueFor(BmsSettingKey.dayToSleep), 7);
+  });
+}

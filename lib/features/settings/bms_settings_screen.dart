@@ -1,0 +1,862 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../../core/localization/app_localizations.dart';
+import '../../core/theme/app_theme.dart';
+import '../devices/saved_device.dart';
+import '../monitoring/ble_debug_controller.dart';
+import 'bms_settings.dart';
+import 'bms_settings_repository.dart';
+
+class BmsSettingsScreen extends StatefulWidget {
+  const BmsSettingsScreen({
+    required this.device,
+    this.demoMode = false,
+    this.initialSettings,
+    this.onSendParameters,
+    super.key,
+  });
+
+  final SavedDevice device;
+  final bool demoMode;
+  final BmsSettings? initialSettings;
+  final Future<void> Function(String payload)? onSendParameters;
+
+  @override
+  State<BmsSettingsScreen> createState() => _BmsSettingsScreenState();
+}
+
+class _BmsSettingsScreenState extends State<BmsSettingsScreen> {
+  BmsSettingsRepository? _settingsRepository;
+  final _controllers = <BmsSettingKey, TextEditingController>{};
+  final _formKey = GlobalKey<FormState>();
+
+  bool _loading = true;
+  bool _saving = false;
+  BmsBatteryType? _selectedBatteryType;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _controllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: _loading
+            ? const Center(
+                child: CircularProgressIndicator(color: AppColors.accent),
+              )
+            : Form(
+                key: _formKey,
+                child: CustomScrollView(
+                  physics: const ClampingScrollPhysics(),
+                  slivers: [
+                    SliverPadding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 14),
+                      sliver: SliverList.list(
+                        children: [
+                          _SettingsHeader(
+                            onBack: () => Navigator.of(context).pop(),
+                          ),
+                          const SizedBox(height: 22),
+                          _BatteryTypePresetCard(
+                            selectedType: _selectedBatteryType,
+                            onSelected: _applyBatteryTypePreset,
+                          ),
+                          const SizedBox(height: 16),
+                          for (final section in BmsSettingsSection.values) ...[
+                            _SettingsSectionCard(
+                              section: section,
+                              batteryType: _selectedBatteryType,
+                              definitions: bmsSettingDefinitions
+                                  .where(
+                                    (definition) =>
+                                        definition.section == section,
+                                  )
+                                  .toList(),
+                              controllers: _controllers,
+                            ),
+                            const SizedBox(height: 16),
+                          ],
+                          FilledButton.icon(
+                            onPressed: _saving ? null : _saveSettings,
+                            style: FilledButton.styleFrom(
+                              minimumSize: const Size.fromHeight(54),
+                              backgroundColor: AppColors.accent,
+                              foregroundColor: Colors.white,
+                              shadowColor: AppColors.accent,
+                              elevation: 6,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                            ),
+                            icon: _saving
+                                ? const SizedBox.square(
+                                    dimension: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Icon(Icons.save_outlined),
+                            label: Text(
+                              _saving
+                                  ? context.translate('Saving…', 'Menyimpan…')
+                                  : context.translate(
+                                      'Save Parameters',
+                                      'Simpan Parameter',
+                                    ),
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 24),
+                          const Text(
+                            AppTheme.brandName,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: AppColors.textMuted,
+                              fontSize: 12,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+      ),
+    );
+  }
+
+  Future<void> _loadSettings() async {
+    final settings =
+        widget.initialSettings ??
+        (widget.demoMode
+            ? BmsSettings.defaults().applyBatteryTypePreset(BmsBatteryType.nmc)
+            : await (_settingsRepository ??= BmsSettingsRepository()).load(
+                widget.device.id,
+              ));
+    if (!mounted) return;
+
+    for (final definition in bmsSettingDefinitions) {
+      _controllers[definition.key] = TextEditingController(
+        text: definition
+            .toDisplayValue(settings.valueFor(definition.key))
+            .toStringAsFixed(definition.decimalPlaces),
+      );
+    }
+    setState(() {
+      _selectedBatteryType = settings.matchingBatteryType;
+      _loading = false;
+    });
+  }
+
+  void _applyBatteryTypePreset(BmsBatteryType batteryType) {
+    for (final entry in batteryType.presetValues.entries) {
+      final definition = bmsSettingDefinitions.firstWhere(
+        (candidate) => candidate.key == entry.key,
+      );
+      _controllers[entry.key]!.text = definition
+          .toDisplayValue(entry.value)
+          .toStringAsFixed(definition.decimalPlaces);
+    }
+    setState(() => _selectedBatteryType = batteryType);
+  }
+
+  Future<void> _saveSettings() async {
+    final validationMessage = _settingsValidationMessage();
+    final formIsValid = _formKey.currentState?.validate() ?? false;
+    if (validationMessage != null || !formIsValid) {
+      _showMessage(
+        validationMessage ??
+            context.translate(
+              'Enter a valid value for every parameter.',
+              'Masukkan nilai yang valid untuk setiap parameter.',
+            ),
+        isError: true,
+      );
+      return;
+    }
+
+    final settings = BmsSettings({
+      for (final definition in bmsSettingDefinitions)
+        definition.key: definition.toProtocolValue(
+          double.parse(_controllers[definition.key]!.text),
+        ),
+    });
+
+    final sender = widget.onSendParameters;
+    if (!widget.demoMode && sender == null) {
+      _showMessage(
+        context.translate(
+          'Connect to the BMS before sending parameters.',
+          'Hubungkan ke BMS sebelum mengirim parameter.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
+    setState(() => _saving = true);
+    try {
+      if (!widget.demoMode) {
+        await sender!(settings.toBluetoothPayload());
+        await (_settingsRepository ??= BmsSettingsRepository()).save(
+          widget.device.id,
+          settings,
+        );
+      }
+      if (!mounted) return;
+
+      _showMessage(
+        widget.demoMode
+            ? context.translate(
+                'Demo parameters saved.',
+                'Parameter demo telah disimpan.',
+              )
+            : context.translate(
+                'Parameters sent to ${widget.device.name} and saved locally.',
+                'Parameter dikirim ke ${widget.device.name} dan disimpan secara lokal.',
+              ),
+      );
+    } on BleWriteException catch (error) {
+      if (!mounted) return;
+      final message = switch (error.failure) {
+        BleWriteFailure.disconnected => context.translate(
+          'The BMS disconnected before parameters could be sent.',
+          'BMS terputus sebelum parameter dapat dikirim.',
+        ),
+        BleWriteFailure.noWritableCharacteristic => context.translate(
+          'No writable Bluetooth characteristic was found on this BMS.',
+          'Karakteristik Bluetooth yang dapat ditulis tidak ditemukan pada BMS ini.',
+        ),
+        BleWriteFailure.transmissionFailed => context.translate(
+          'Bluetooth parameter transmission failed. Please try again.',
+          'Pengiriman parameter melalui Bluetooth gagal. Silakan coba lagi.',
+        ),
+      };
+      _showMessage(message, isError: true);
+    } on Object {
+      if (!mounted) return;
+      _showMessage(
+        context.translate(
+          'Parameters could not be sent. Please try again.',
+          'Parameter tidak dapat dikirim. Silakan coba lagi.',
+        ),
+        isError: true,
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  String? _settingsValidationMessage() {
+    final batteryType = _selectedBatteryType;
+    if (batteryType == null) {
+      return context.translate(
+        'Select LFP, NMC, or LTO before saving parameters.',
+        'Pilih LFP, NMC, atau LTO sebelum menyimpan parameter.',
+      );
+    }
+
+    final values = <BmsSettingKey, double>{};
+    for (final definition in bmsSettingDefinitions) {
+      final rawValue = _controllers[definition.key]?.text ?? '';
+      final value = double.tryParse(rawValue);
+      if (value == null || value < 0) {
+        return context.translate(
+          'Enter a valid value for ${definition.label.replaceAll('\n', ' ')}.',
+          'Masukkan nilai yang valid untuk ${_localizedSettingLabel(context, definition).replaceAll('\n', ' ')}.',
+        );
+      }
+      if (definition.key == BmsSettingKey.resistorShunt &&
+          !_hasExactlyThreeDecimalPlaces(rawValue)) {
+        return context.translate(
+          'Resistor Shunt must have exactly 3 digits after the decimal point.',
+          'Resistor Shunt harus memiliki tepat 3 angka setelah tanda desimal.',
+        );
+      }
+      values[definition.key] = value;
+      final limit = bmsSettingValueLimitFor(definition.key, batteryType);
+      final protocolValue = definition.toProtocolValue(value);
+      if (limit == null || limit.allows(protocolValue)) continue;
+
+      if (definition.key == BmsSettingKey.overTemperatureBattery) {
+        return context.translate(
+          'Over Temperature Battery must be below 60°C.',
+          'Suhu Baterai Berlebih harus di bawah 60°C.',
+        );
+      }
+      if (definition.key == BmsSettingKey.balancingMinimum) {
+        return context.translate(
+          'Balancing Minimum must be above 0 and below 2.800 V.',
+          'Tegangan Minimum Penyeimbangan harus di atas 0 dan di bawah 2.800 V.',
+        );
+      }
+      if (limit.minimumExclusive != null && limit.maximumExclusive == null) {
+        return context.translate(
+          '${definition.label.replaceAll('\n', ' ')} must be above 0.',
+          '${_localizedSettingLabel(context, definition).replaceAll('\n', ' ')} harus di atas 0.',
+        );
+      }
+      return context.translate(
+        '${definition.label.replaceAll('\n', ' ')} for ${batteryType.label} '
+            'must be above ${_formatMillivoltsAsVolts(limit.minimumExclusive!)} '
+            'and below ${_formatMillivoltsAsVolts(limit.maximumExclusive!)} V.',
+        '${_localizedSettingLabel(context, definition).replaceAll('\n', ' ')} '
+            'untuk ${batteryType.label} harus di atas '
+            '${_formatMillivoltsAsVolts(limit.minimumExclusive!)} dan di bawah '
+            '${_formatMillivoltsAsVolts(limit.maximumExclusive!)} V.',
+      );
+    }
+
+    if (values[BmsSettingKey.overVoltageRelease]! >=
+        values[BmsSettingKey.overVoltageProtection]!) {
+      return context.translate(
+        'Over Voltage Protection Release must be below Over Voltage Protection.',
+        'Pelepasan Proteksi Tegangan Berlebih harus di bawah Proteksi Tegangan Berlebih.',
+      );
+    }
+    if (values[BmsSettingKey.underVoltageRelease]! <=
+        values[BmsSettingKey.underVoltageProtection]!) {
+      return context.translate(
+        'Under Voltage Protection Release must be above Under Voltage Protection.',
+        'Pelepasan Proteksi Tegangan Rendah harus di atas Proteksi Tegangan Rendah.',
+      );
+    }
+    return null;
+  }
+
+  void _showMessage(String message, {bool isError = false}) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: isError ? AppColors.danger : null,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+  }
+}
+
+class _SettingsHeader extends StatelessWidget {
+  const _SettingsHeader({required this.onBack});
+
+  final VoidCallback onBack;
+
+  static const _buttonSize = 44.0;
+
+  @override
+  Widget build(BuildContext context) {
+    final shape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(12),
+      side: const BorderSide(color: AppColors.border),
+    );
+    return Row(
+      children: [
+        Tooltip(
+          message: context.translate('Back', 'Kembali'),
+          child: Material(
+            color: AppColors.surface,
+            shape: shape,
+            child: InkWell(
+              onTap: onBack,
+              customBorder: shape,
+              child: const SizedBox.square(
+                dimension: _buttonSize,
+                child: Icon(
+                  Icons.arrow_back_ios_new_rounded,
+                  color: AppColors.accent,
+                  size: 18,
+                ),
+              ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: Column(
+            children: [
+              Text(
+                context.translate('BMS Setting', 'Pengaturan BMS'),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: AppColors.text,
+                  fontSize: 21,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                context.translate(
+                  'Configure battery protection parameters',
+                  'Atur parameter perlindungan baterai',
+                ),
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: AppColors.textMuted,
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: _buttonSize),
+      ],
+    );
+  }
+}
+
+class _SettingsCard extends StatelessWidget {
+  const _SettingsCard({
+    required this.icon,
+    required this.tone,
+    required this.title,
+    required this.subtitle,
+    required this.children,
+  });
+
+  final IconData icon;
+  final Color tone;
+  final String title;
+  final String subtitle;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 50,
+                height: 50,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: tone.withValues(alpha: 0.16),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: tone.withValues(alpha: 0.3)),
+                ),
+                child: Icon(icon, color: tone, size: 26),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: AppColors.text,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: AppColors.textMuted,
+                        fontSize: 12.5,
+                        height: 1.3,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          ...children,
+        ],
+      ),
+    );
+  }
+}
+
+class _BatteryTypePresetCard extends StatelessWidget {
+  const _BatteryTypePresetCard({
+    required this.selectedType,
+    required this.onSelected,
+  });
+
+  final BmsBatteryType? selectedType;
+  final ValueChanged<BmsBatteryType> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedType = this.selectedType;
+    return _SettingsCard(
+      icon: Icons.battery_saver_outlined,
+      tone: AppColors.info,
+      title: context.translate('Battery Type', 'Jenis Baterai'),
+      subtitle: context.translate(
+        'Choose a chemistry preset, then review the values before saving.',
+        'Pilih preset kimia, lalu periksa nilainya sebelum menyimpan.',
+      ),
+      children: [
+        Container(
+          height: 52,
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            color: AppColors.background.withValues(alpha: 0.5),
+            border: Border.all(color: AppColors.border),
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Row(
+            children: [
+              for (final (index, batteryType)
+                  in BmsBatteryType.values.indexed) ...[
+                if (index > 0)
+                  Container(
+                    width: 1,
+                    margin: const EdgeInsets.symmetric(vertical: 6),
+                    color:
+                        batteryType == selectedType ||
+                            BmsBatteryType.values[index - 1] == selectedType
+                        ? Colors.transparent
+                        : AppColors.border,
+                  ),
+                Expanded(
+                  child: _BatteryTypeOption(
+                    label: batteryType.label,
+                    selected: batteryType == selectedType,
+                    onTap: () => onSelected(batteryType),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        if (selectedType != null) ...[
+          const SizedBox(height: 10),
+          Text(
+            _batteryTypeLimitText(context, selectedType),
+            style: const TextStyle(
+              color: AppColors.textMuted,
+              fontSize: 11.5,
+              height: 1.35,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _BatteryTypeOption extends StatelessWidget {
+  const _BatteryTypeOption({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(11),
+        boxShadow: selected
+            ? [
+                BoxShadow(
+                  color: AppColors.accent.withValues(alpha: 0.45),
+                  blurRadius: 14,
+                ),
+              ]
+            : null,
+      ),
+      child: Material(
+        color: selected ? AppColors.accent : Colors.transparent,
+        borderRadius: BorderRadius.circular(11),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(11),
+          child: Center(
+            child: Text(
+              label,
+              style: TextStyle(
+                color: selected ? Colors.white : AppColors.text,
+                fontSize: 15,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SettingsSectionCard extends StatelessWidget {
+  const _SettingsSectionCard({
+    required this.section,
+    required this.batteryType,
+    required this.definitions,
+    required this.controllers,
+  });
+
+  final BmsSettingsSection section;
+  final BmsBatteryType? batteryType;
+  final List<BmsSettingDefinition> definitions;
+  final Map<BmsSettingKey, TextEditingController> controllers;
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, tone, title, subtitle) = switch (section) {
+      BmsSettingsSection.voltageProtection => (
+        Icons.bolt_rounded,
+        AppColors.info,
+        context.translate('Voltage Protection', 'Perlindungan Tegangan'),
+        context.translate(
+          'Set the voltage limits for cell protection.',
+          'Atur batas tegangan untuk perlindungan sel.',
+        ),
+      ),
+      BmsSettingsSection.currentAndDelay => (
+        Icons.monitor_heart_outlined,
+        AppColors.success,
+        context.translate('Current & Delay Controls', 'Kontrol Arus & Jeda'),
+        context.translate(
+          'Set the current limits and delay times.',
+          'Atur batas arus dan waktu jeda.',
+        ),
+      ),
+      BmsSettingsSection.temperature => (
+        Icons.thermostat_rounded,
+        AppColors.warning,
+        context.translate('Temperature Controls', 'Kontrol Suhu'),
+        context.translate(
+          'Set the temperature limits for protection.',
+          'Atur batas suhu untuk perlindungan.',
+        ),
+      ),
+      BmsSettingsSection.systemAndBalancing => (
+        Icons.tune_rounded,
+        AppColors.accent,
+        context.translate('System & Balancing', 'Sistem & Penyeimbangan'),
+        context.translate(
+          'Set capacity, shunt, cell balancing and sleep timing.',
+          'Atur kapasitas, shunt, penyeimbangan sel, dan waktu tidur.',
+        ),
+      ),
+    };
+
+    return _SettingsCard(
+      icon: icon,
+      tone: tone,
+      title: title,
+      subtitle: subtitle,
+      children: [
+        for (var index = 0; index < definitions.length; index++) ...[
+          _SettingRow(
+            definition: definitions[index],
+            controller: controllers[definitions[index].key]!,
+            batteryType: batteryType,
+          ),
+          if (index < definitions.length - 1)
+            const Divider(height: 1, color: AppColors.border),
+        ],
+      ],
+    );
+  }
+}
+
+class _SettingRow extends StatelessWidget {
+  const _SettingRow({
+    required this.definition,
+    required this.controller,
+    required this.batteryType,
+  });
+
+  final BmsSettingDefinition definition;
+  final TextEditingController controller;
+  final BmsBatteryType? batteryType;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 9, 0, 9),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              _localizedSettingLabel(context, definition),
+              style: const TextStyle(
+                color: AppColors.text,
+                fontSize: 14.5,
+                height: 1.3,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          SizedBox(
+            width: 128,
+            height: 44,
+            child: TextFormField(
+              controller: controller,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(
+                  definition.key == BmsSettingKey.resistorShunt
+                      ? RegExp(r'^\d*\.?\d{0,3}$')
+                      : RegExp(r'^\d*\.?\d*$'),
+                ),
+              ],
+              textAlign: TextAlign.right,
+              textAlignVertical: TextAlignVertical.center,
+              style: const TextStyle(
+                color: AppColors.text,
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+              ),
+              decoration: InputDecoration(
+                filled: true,
+                fillColor: AppColors.background.withValues(alpha: 0.55),
+                isDense: true,
+                contentPadding: const EdgeInsets.fromLTRB(10, 12, 12, 12),
+                suffixText: definition.unit == 'days'
+                    ? context.translate('days', 'hari')
+                    : definition.unit,
+                suffixStyle: const TextStyle(
+                  color: AppColors.textMuted,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w400,
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(color: AppColors.border),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(
+                    color: AppColors.accent,
+                    width: 1.5,
+                  ),
+                ),
+                errorBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(color: AppColors.danger),
+                ),
+                focusedErrorBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(
+                    color: AppColors.danger,
+                    width: 1.5,
+                  ),
+                ),
+                errorStyle: const TextStyle(fontSize: 0, height: 0),
+              ),
+              validator: (value) {
+                final number = double.tryParse(value ?? '');
+                if (number == null || number < 0) return '';
+                final limit = bmsSettingValueLimitFor(
+                  definition.key,
+                  batteryType,
+                );
+                final protocolValue = definition.toProtocolValue(number);
+                return limit != null && !limit.allows(protocolValue)
+                    ? ''
+                    : null;
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+bool _hasExactlyThreeDecimalPlaces(String value) =>
+    RegExp(r'^\d+\.\d{3}$').hasMatch(value);
+
+String _batteryTypeLimitText(BuildContext context, BmsBatteryType batteryType) {
+  final underVoltage = bmsSettingValueLimitFor(
+    BmsSettingKey.underVoltageProtection,
+    batteryType,
+  )!;
+  final overVoltage = bmsSettingValueLimitFor(
+    BmsSettingKey.overVoltageProtection,
+    batteryType,
+  )!;
+  return context.translate(
+    '${batteryType.label}: UVP '
+        '>${_formatMillivoltsAsVolts(underVoltage.minimumExclusive!)} and '
+        '<${_formatMillivoltsAsVolts(underVoltage.maximumExclusive!)} V • OVP '
+        '>${_formatMillivoltsAsVolts(overVoltage.minimumExclusive!)} and '
+        '<${_formatMillivoltsAsVolts(overVoltage.maximumExclusive!)} V • '
+        'Battery temperature '
+        '<60°C',
+    '${batteryType.label}: UVP '
+        '>${_formatMillivoltsAsVolts(underVoltage.minimumExclusive!)} dan '
+        '<${_formatMillivoltsAsVolts(underVoltage.maximumExclusive!)} V • OVP '
+        '>${_formatMillivoltsAsVolts(overVoltage.minimumExclusive!)} dan '
+        '<${_formatMillivoltsAsVolts(overVoltage.maximumExclusive!)} V • '
+        'Suhu baterai <60°C',
+  );
+}
+
+String _formatMillivoltsAsVolts(double millivolts) {
+  return (millivolts / 1000).toStringAsFixed(3);
+}
+
+String _localizedSettingLabel(
+  BuildContext context,
+  BmsSettingDefinition definition,
+) {
+  final indonesian = switch (definition.key) {
+    BmsSettingKey.overVoltageProtection => 'Perlindungan Tegangan Berlebih',
+    BmsSettingKey.overVoltageRelease =>
+      'Pelepasan Perlindungan\nTegangan Berlebih',
+    BmsSettingKey.underVoltageProtection => 'Perlindungan Tegangan Rendah',
+    BmsSettingKey.underVoltageRelease =>
+      'Pelepasan Perlindungan\nTegangan Rendah',
+    BmsSettingKey.overCurrentCharge => 'Arus Pengisian Berlebih',
+    BmsSettingKey.delayOverCurrentCharge => 'Jeda Arus Pengisian Berlebih',
+    BmsSettingKey.overCurrentDischarge => 'Arus Pengosongan Berlebih',
+    BmsSettingKey.delayOverCurrentDischarge =>
+      'Jeda Arus Pengosongan\nBerlebih',
+    BmsSettingKey.overTemperatureBattery => 'Suhu Baterai Berlebih',
+    BmsSettingKey.overTemperatureBatteryRelease =>
+      'Pelepasan Suhu Baterai Berlebih',
+    BmsSettingKey.overTemperatureMosfet => 'Suhu MOSFET Berlebih',
+    BmsSettingKey.overTemperatureMosfetRelease =>
+      'Pelepasan Suhu MOSFET Berlebih',
+    BmsSettingKey.batteryCapacity => 'Kapasitas Baterai',
+    BmsSettingKey.resistorShunt => 'Resistor Shunt',
+    BmsSettingKey.balancingMinimum => 'Minimum Penyeimbangan',
+    BmsSettingKey.balancingDifferent => 'Selisih Penyeimbangan',
+    BmsSettingKey.dayToSleep => 'Hari Menuju Tidur',
+  };
+  return context.translate(definition.label, indonesian);
+}
